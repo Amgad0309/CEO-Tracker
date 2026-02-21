@@ -1,3 +1,5 @@
+import socket
+from urllib.parse import urlparse
 """
 app.py
 
@@ -45,7 +47,37 @@ def get_database_url() -> str:
 
 
 def conn(cfg: DbConfig):
-    return psycopg2.connect(cfg.database_url)
+    """
+    Force IPv4 because Streamlit Cloud sometimes can't connect to Supabase over IPv6.
+    Works with DATABASE_URL in either URL or DSN format.
+    """
+    dsn = cfg.database_url.strip()
+
+    # DSN format: "dbname=... user=... password=... host=... port=... sslmode=require"
+    if "://" not in dsn:
+        # If DSN includes host=..., force hostaddr (IPv4)
+        m = re.search(r"\bhost=([^\s]+)", dsn)
+        if m:
+            host = m.group(1)
+            hostaddr = socket.gethostbyname(host)  # IPv4
+            if "hostaddr=" not in dsn:
+                dsn = f"{dsn} hostaddr={hostaddr}"
+        return psycopg2.connect(dsn)
+
+    # URL format: "postgresql://user:pass@host:port/db?sslmode=require"
+    u = urlparse(dsn)
+    host = u.hostname or ""
+    hostaddr = socket.gethostbyname(host)  # IPv4
+
+    return psycopg2.connect(
+        dbname=(u.path or "/postgres").lstrip("/"),
+        user=u.username or "postgres",
+        password=u.password or "",
+        host=host,
+        hostaddr=hostaddr,          # <-- forces IPv4
+        port=u.port or 5432,
+        sslmode="require",          # Supabase requires SSL
+    )
 
 
 def init_db(cfg: DbConfig) -> None:

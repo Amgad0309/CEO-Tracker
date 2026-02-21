@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import math
 import re
-import sqlite3
+import psycopg2
+import os
+from typing import Any
 import time
 import uuid
 from dataclasses import dataclass
@@ -131,16 +133,72 @@ def bucket_to_anchor_date(period: str, key: str) -> date:
 
 
 # -------------------------
-# DB
+# DB (Postgres via Supabase) - SQLite-compatible adapter
 # -------------------------
 
 @dataclass(frozen=True)
 class DbConfig:
-    sqlite_path: str = DB_NAME
+    database_url: str
 
 
-def get_conn(cfg: DbConfig) -> sqlite3.Connection:
-    return sqlite3.connect(cfg.sqlite_path, check_same_thread=False)
+def _get_database_url() -> str:
+    # Prefer Streamlit secrets (Streamlit Cloud), then env var fallback.
+    if "DATABASE_URL" in st.secrets:
+        return str(st.secrets["DATABASE_URL"])
+    return os.environ["DATABASE_URL"]
+
+
+class PgConn:
+    """
+    Tiny adapter so existing sqlite-style code works:
+    - conn.execute(sql, params) -> cursor
+    - conn.executemany(sql, seq_of_params)
+    - conn.commit()
+    """
+    def __init__(self, database_url: str):
+        self._database_url = database_url
+        self._conn: psycopg2.extensions.connection | None = None
+
+    def __enter__(self) -> "PgConn":
+        self._conn = psycopg2.connect(self._database_url)
+        self._conn.autocommit = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        assert self._conn is not None
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+            self._conn = None
+
+    def commit(self) -> None:
+        assert self._conn is not None
+        self._conn.commit()
+
+    @staticmethod
+    def _sql(sql: str) -> str:
+        # Convert sqlite qmark params "?" -> psycopg2 "%s"
+        return sql.replace("?", "%s")
+
+    def execute(self, sql: str, params: Tuple[Any, ...] | List[Any] | None = None):
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.execute(self._sql(sql), params or ())
+        return cur
+
+    def executemany(self, sql: str, seq_of_params):
+        assert self._conn is not None
+        cur = self._conn.cursor()
+        cur.executemany(self._sql(sql), seq_of_params)
+        return cur
+
+
+def get_conn(cfg: DbConfig) -> PgConn:
+    return PgConn(cfg.database_url)
 
 
 def init_db(cfg: DbConfig) -> None:
@@ -159,7 +217,6 @@ def init_db(cfg: DbConfig) -> None:
             """
         )
 
-        # items (with migration for priority)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS items (
@@ -171,43 +228,37 @@ def init_db(cfg: DbConfig) -> None:
             )
             """
         )
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
-        if "priority" not in cols:
-            conn.execute("ALTER TABLE items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
-        # weekly priority overrides
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS item_priority_overrides (
                 user TEXT NOT NULL,
                 period TEXT NOT NULL,
-                week_monday TEXT NOT NULL,  -- YYYY-MM-DD
-                item TEXT NOT NULL,         -- items.text
+                week_monday TEXT NOT NULL,
+                item TEXT NOT NULL,
                 priority INTEGER NOT NULL,
                 PRIMARY KEY (user, period, week_monday, item)
             )
             """
         )
 
-        # pomodoro daily totals
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pomodoro_daily (
                 user TEXT NOT NULL,
-                day TEXT NOT NULL,          -- YYYY-MM-DD
+                day TEXT NOT NULL,
                 work_sessions INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user, day)
             )
             """
         )
 
-        # pomodoro events for recent pace
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pomodoro_events (
                 user TEXT NOT NULL,
-                ts_utc INTEGER NOT NULL,    -- epoch seconds UTC
-                day TEXT NOT NULL           -- YYYY-MM-DD (local day label)
+                ts_utc INTEGER NOT NULL,
+                day TEXT NOT NULL
             )
             """
         )
@@ -1682,7 +1733,7 @@ def main() -> None:
     st.set_page_config(page_title="CEO Execution Tracker", layout="wide")
     st.title("📈 CEO Execution Tracker")
 
-    cfg = DbConfig()
+    cfg = DbConfig(database_url=_get_database_url())
     init_db(cfg)
     user = SINGLE_USER_ID
 
@@ -1696,6 +1747,20 @@ def main() -> None:
         bkey = bucket_key(period, selected_date)
 
         items = get_items(cfg, period, user=user, for_date=selected_date)
+        edit_mode = st.toggle("✏️ Edit items (this period)", value=False, key="main_edit_items")
+
+        if edit_mode:
+            edited = st.text_area(
+                "Edit items (one per line). Saving replaces the whole list for this period.",
+                value="\n".join(items),
+                height=220,
+                key="main_edit_items_text",
+            )
+            if st.button("Save item list", use_container_width=True, key="main_edit_items_save"):
+                new_items = [x.strip() for x in edited.splitlines() if x.strip()]
+                seed_items(cfg, period, new_items)
+                st.success("Items updated.")
+                st.rerun()
         if not items:
             st.warning("No items yet. Open the sidebar → 'Seed / Replace items' and add your list.")
             st.stop()

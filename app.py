@@ -1,6 +1,9 @@
 app.py
+from __future__ import annotations
 
+"""
 CEO Execution Tracker (Streamlit + Supabase Postgres)
+"""
 
 What you get:
 - Daily/Weekly/Monthly checklists
@@ -9,20 +12,17 @@ What you get:
 - Weekly priority overrides (per week)
 - Google Calendar daily event links (New York) using "top focus item"
 """
-import socket
-from urllib.parse import urlparse
-"""
-
-from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dtime
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlencode, quote
-
 import psycopg2
 import streamlit as st
+import socket
+from urllib.parse import urlparse
+
 
 PERIODS = ["Daily", "Weekly", "Monthly"]
 USER_ID = "me"

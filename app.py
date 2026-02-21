@@ -282,7 +282,7 @@ def save_entries(cfg: DbConfig, user_id: str, bucket: str, period: str, entries:
                 """
                 INSERT INTO entries (user_id, bucket, period, item, completed, note)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                """,
+                """)
                 [(user_id, bucket, period, item, done, note or "") for item, (done, note) in entries.items()],
             )
         c.commit()

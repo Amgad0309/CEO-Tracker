@@ -1,6 +1,3 @@
-import socket
-from urllib.parse import urlparse
-"""
 app.py
 
 CEO Execution Tracker (Streamlit + Supabase Postgres)
@@ -11,6 +8,9 @@ What you get:
 - Base priority per item
 - Weekly priority overrides (per week)
 - Google Calendar daily event links (New York) using "top focus item"
+"""
+import socket
+from urllib.parse import urlparse
 """
 
 from __future__ import annotations

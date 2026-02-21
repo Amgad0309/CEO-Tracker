@@ -48,23 +48,35 @@ def get_database_url() -> str:
 
 def conn(cfg: DbConfig):
     """
-    Force IPv4 because Streamlit Cloud sometimes can't connect to Supabase over IPv6.
-    Works with DATABASE_URL in either URL or DSN format.
+    Supabase + Streamlit Cloud reliability:
+    - Forces IPv4 via hostaddr
+    - Forces SSL
+    - Adds connect_timeout
+    - Supports DATABASE_URL as either URL or DSN string
     """
     dsn = cfg.database_url.strip()
 
-    # DSN format: "dbname=... user=... password=... host=... port=... sslmode=require"
+    # DSN format (recommended if password has special chars):
+    # "dbname=postgres user=postgres password=... host=db.xxx.supabase.co port=5432 sslmode=require"
     if "://" not in dsn:
-        # If DSN includes host=..., force hostaddr (IPv4)
+        # Force sslmode=require if missing
+        if "sslmode=" not in dsn:
+            dsn = f"{dsn} sslmode=require"
+
+        # Force connect_timeout if missing
+        if "connect_timeout=" not in dsn:
+            dsn = f"{dsn} connect_timeout=10"
+
+        # Force IPv4 with hostaddr
         m = re.search(r"\bhost=([^\s]+)", dsn)
-        if m:
+        if m and "hostaddr=" not in dsn:
             host = m.group(1)
             hostaddr = socket.gethostbyname(host)  # IPv4
-            if "hostaddr=" not in dsn:
-                dsn = f"{dsn} hostaddr={hostaddr}"
+            dsn = f"{dsn} hostaddr={hostaddr}"
+
         return psycopg2.connect(dsn)
 
-    # URL format: "postgresql://user:pass@host:port/db?sslmode=require"
+    # URL format:
     u = urlparse(dsn)
     host = u.hostname or ""
     hostaddr = socket.gethostbyname(host)  # IPv4
@@ -74,11 +86,11 @@ def conn(cfg: DbConfig):
         user=u.username or "postgres",
         password=u.password or "",
         host=host,
-        hostaddr=hostaddr,          # <-- forces IPv4
+        hostaddr=hostaddr,      # <- forces IPv4
         port=u.port or 5432,
-        sslmode="require",          # Supabase requires SSL
+        sslmode="require",
+        connect_timeout=10,
     )
-
 
 def init_db(cfg: DbConfig) -> None:
     with conn(cfg) as c:

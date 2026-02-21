@@ -1,9 +1,8 @@
-app.py
+# app.py
 from __future__ import annotations
 
 """
 CEO Execution Tracker (Streamlit + Supabase Postgres)
-"""
 
 What you get:
 - Daily/Weekly/Monthly checklists
@@ -14,14 +13,15 @@ What you get:
 """
 
 import os
+import re
+import socket
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dtime
-from typing import Dict, List, Tuple, Optional
-from urllib.parse import urlencode, quote
+from typing import Dict, List, Tuple
+from urllib.parse import urlencode, quote, urlparse
+
 import psycopg2
 import streamlit as st
-import socket
-from urllib.parse import urlparse
 
 
 PERIODS = ["Daily", "Weekly", "Monthly"]
@@ -49,25 +49,21 @@ def get_database_url() -> str:
 def conn(cfg: DbConfig):
     """
     Supabase + Streamlit Cloud reliability:
-    - Forces IPv4 via hostaddr
+    - Forces IPv4 via hostaddr (avoids IPv6 issues on Streamlit Cloud)
     - Forces SSL
     - Adds connect_timeout
     - Supports DATABASE_URL as either URL or DSN string
     """
     dsn = cfg.database_url.strip()
 
-    # DSN format (recommended if password has special chars):
+    # DSN format:
     # "dbname=postgres user=postgres password=... host=db.xxx.supabase.co port=5432 sslmode=require"
     if "://" not in dsn:
-        # Force sslmode=require if missing
         if "sslmode=" not in dsn:
             dsn = f"{dsn} sslmode=require"
-
-        # Force connect_timeout if missing
         if "connect_timeout=" not in dsn:
             dsn = f"{dsn} connect_timeout=10"
 
-        # Force IPv4 with hostaddr
         m = re.search(r"\bhost=([^\s]+)", dsn)
         if m and "hostaddr=" not in dsn:
             host = m.group(1)
@@ -86,11 +82,12 @@ def conn(cfg: DbConfig):
         user=u.username or "postgres",
         password=u.password or "",
         host=host,
-        hostaddr=hostaddr,      # <- forces IPv4
+        hostaddr=hostaddr,  # forces IPv4
         port=u.port or 5432,
         sslmode="require",
         connect_timeout=10,
     )
+
 
 def init_db(cfg: DbConfig) -> None:
     with conn(cfg) as c:
@@ -282,10 +279,9 @@ def save_entries(cfg: DbConfig, user_id: str, bucket: str, period: str, entries:
                 """
                 INSERT INTO entries (user_id, bucket, period, item, completed, note)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                """)
+                """,
                 [(user_id, bucket, period, item, done, note or "") for item, (done, note) in entries.items()],
             )
-            
         c.commit()
 
 
@@ -369,9 +365,19 @@ def main() -> None:
     st.title("📈 CEO Execution Tracker")
 
     cfg = DbConfig(database_url=get_database_url())
+
+    try:
+        with conn(cfg) as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT 1;")
+        st.sidebar.success("✅ Database connected")
+    except Exception as e:
+        st.sidebar.error(f"❌ DB connection failed: {type(e).__name__}")
+        st.sidebar.code(str(e)[:500])
+        st.stop()
+
     init_db(cfg)
 
-    # Sidebar: one-click setup + admin
     with st.sidebar:
         st.header("Setup")
         if st.button("🚀 First-time setup (seed starter lists)", use_container_width=True):
@@ -449,7 +455,6 @@ def main() -> None:
             st.warning("No items yet. Click sidebar: First-time setup.")
             st.stop()
 
-        # Main-page item editor
         if st.toggle("✏️ Edit items (this period)", value=False, key="edit_items_toggle"):
             edited = st.text_area(
                 "One item per line (saving replaces the whole list).",
@@ -491,6 +496,7 @@ def main() -> None:
         url = gcal_link(title, start_dt, end_dt, details, tz=NY_TZ)
         st.link_button("Add to Google Calendar", url, use_container_width=True)
         st.caption("Tap on Android → Google Calendar opens with the event prefilled.")
+
 
 if __name__ == "__main__":
     main()

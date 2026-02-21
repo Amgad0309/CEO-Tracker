@@ -2,27 +2,29 @@
 from __future__ import annotations
 
 """
-CEO Execution Tracker (Streamlit + Supabase Postgres)
+CEO Execution Tracker (Streamlit + SQLite)
 
-What you get:
+Zero-cloud-DB version:
 - Daily/Weekly/Monthly checklists
 - Notes per item
-- Base priority per item
-- Weekly priority overrides (per week)
-- Google Calendar daily event links (New York) using "top focus item"
+- Edit items on main page
+- One-click seed starter lists
+- Google Calendar link (New York)
+
+Run locally:
+  streamlit run app.py
+
+Tip for phone:
+  Run on laptop, then open the Network URL shown by Streamlit on your phone.
 """
 
-import os
-import re
-import socket
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dtime
 from typing import Dict, List, Tuple
-from urllib.parse import urlencode, quote, urlparse
+from urllib.parse import urlencode, quote
 
-import psycopg2
 import streamlit as st
-
 
 PERIODS = ["Daily", "Weekly", "Monthly"]
 USER_ID = "me"
@@ -30,104 +32,46 @@ NY_TZ = "America/New_York"
 
 
 # ----------------------------
-# DB
+# SQLite DB
 # ----------------------------
 
 @dataclass(frozen=True)
 class DbConfig:
-    database_url: str
+    path: str = "ceo_tracker.db"
 
 
-def get_database_url() -> str:
-    if "DATABASE_URL" in st.secrets:
-        return str(st.secrets["DATABASE_URL"])
-    if "DATABASE_URL" in os.environ:
-        return os.environ["DATABASE_URL"]
-    raise RuntimeError("Missing DATABASE_URL. Add it in Streamlit Secrets.")
-
-
-def conn(cfg: DbConfig):
-    """
-    Supabase + Streamlit Cloud reliability:
-    - Forces IPv4 via hostaddr (avoids IPv6 issues on Streamlit Cloud)
-    - Forces SSL
-    - Adds connect_timeout
-    - Supports DATABASE_URL as either URL or DSN string
-    """
-    dsn = cfg.database_url.strip()
-
-    # DSN format:
-    # "dbname=postgres user=postgres password=... host=db.xxx.supabase.co port=5432 sslmode=require"
-    if "://" not in dsn:
-        if "sslmode=" not in dsn:
-            dsn = f"{dsn} sslmode=require"
-        if "connect_timeout=" not in dsn:
-            dsn = f"{dsn} connect_timeout=10"
-
-        m = re.search(r"\bhost=([^\s]+)", dsn)
-        if m and "hostaddr=" not in dsn:
-            host = m.group(1)
-            hostaddr = socket.gethostbyname(host)  # IPv4
-            dsn = f"{dsn} hostaddr={hostaddr}"
-
-        return psycopg2.connect(dsn)
-
-    # URL format:
-    u = urlparse(dsn)
-    host = u.hostname or ""
-    hostaddr = socket.gethostbyname(host)  # IPv4
-
-    return psycopg2.connect(
-        dbname=(u.path or "/postgres").lstrip("/"),
-        user=u.username or "postgres",
-        password=u.password or "",
-        host=host,
-        hostaddr=hostaddr,  # forces IPv4
-        port=u.port or 5432,
-        sslmode="require",
-        connect_timeout=10,
-    )
+def conn(cfg: DbConfig) -> sqlite3.Connection:
+    c = sqlite3.connect(cfg.path, check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c
 
 
 def init_db(cfg: DbConfig) -> None:
     with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS items (
-                    period TEXT NOT NULL,
-                    position INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (period, position)
-                )
-                """
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS items (
+                period TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (period, position)
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS entries (
-                    user_id TEXT NOT NULL,
-                    bucket TEXT NOT NULL,
-                    period TEXT NOT NULL,
-                    item TEXT NOT NULL,
-                    completed BOOLEAN NOT NULL,
-                    note TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (user_id, bucket, period, item)
-                )
-                """
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entries (
+                user_id TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                period TEXT NOT NULL,
+                item TEXT NOT NULL,
+                completed INTEGER NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (user_id, bucket, period, item)
             )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS item_priority_overrides (
-                    user_id TEXT NOT NULL,
-                    period TEXT NOT NULL,
-                    week_monday TEXT NOT NULL,
-                    item TEXT NOT NULL,
-                    priority INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, period, week_monday, item)
-                )
-                """
-            )
+            """
+        )
         c.commit()
 
 
@@ -143,110 +87,35 @@ def bucket_key(period: str, d: date) -> str:
     if period == "Daily":
         return d.isoformat()
     if period == "Weekly":
-        iso_year, iso_week, _ = d.isocalendar()
-        return f"{iso_year}-W{iso_week:02d}"
+        y, w, _ = d.isocalendar()
+        return f"{y}-W{w:02d}"
     if period == "Monthly":
         return f"{d.year:04d}-{d.month:02d}"
     raise ValueError("Unknown period")
 
 
 # ----------------------------
-# Items + priorities
+# Items
 # ----------------------------
 
 def seed_items(cfg: DbConfig, period: str, items: List[str]) -> None:
     cleaned = [x.strip() for x in items if x and x.strip()]
     with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute("DELETE FROM items WHERE period=%s", (period,))
-            cur.executemany(
-                "INSERT INTO items (period, position, text, priority) VALUES (%s, %s, %s, 0)",
-                [(period, i + 1, t) for i, t in enumerate(cleaned)],
-            )
+        c.execute("DELETE FROM items WHERE period=?", (period,))
+        c.executemany(
+            "INSERT INTO items (period, position, text, priority) VALUES (?, ?, ?, 0)",
+            [(period, i + 1, t) for i, t in enumerate(cleaned)],
+        )
         c.commit()
 
 
-def get_items_with_effective_priority(cfg: DbConfig, user_id: str, period: str, for_date: date) -> List[str]:
-    wk = monday_of_week(for_date).isoformat()
+def get_items(cfg: DbConfig, period: str) -> List[str]:
     with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                """
-                SELECT i.text
-                FROM items i
-                LEFT JOIN item_priority_overrides o
-                  ON o.user_id=%s AND o.period=i.period AND o.week_monday=%s AND o.item=i.text
-                WHERE i.period=%s
-                ORDER BY COALESCE(o.priority, i.priority) DESC, i.position ASC
-                """,
-                (user_id, wk, period),
-            )
-            return [r[0] for r in cur.fetchall()]
-
-
-def get_items_for_edit(cfg: DbConfig, period: str) -> List[Tuple[int, str, int]]:
-    with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "SELECT position, text, priority FROM items WHERE period=%s ORDER BY position ASC",
-                (period,),
-            )
-            return [(int(p), str(t), int(pr)) for p, t, pr in cur.fetchall()]
-
-
-def save_base_priorities(cfg: DbConfig, period: str, updates: List[Tuple[int, int]]) -> None:
-    if not updates:
-        return
-    with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.executemany(
-                "UPDATE items SET priority=%s WHERE period=%s AND position=%s",
-                [(prio, period, pos) for pos, prio in updates],
-            )
-        c.commit()
-
-
-def get_weekly_overrides(cfg: DbConfig, user_id: str, period: str, week_monday: date) -> Dict[str, int]:
-    wk = week_monday.isoformat()
-    with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                """
-                SELECT item, priority
-                FROM item_priority_overrides
-                WHERE user_id=%s AND period=%s AND week_monday=%s
-                """,
-                (user_id, period, wk),
-            )
-            return {str(item): int(p) for item, p in cur.fetchall()}
-
-
-def save_weekly_overrides(cfg: DbConfig, user_id: str, period: str, week_monday: date, overrides: Dict[str, int]) -> None:
-    wk = week_monday.isoformat()
-    with conn(cfg) as c:
-        with c.cursor() as cur:
-            for item, prio in overrides.items():
-                cur.execute(
-                    """
-                    INSERT INTO item_priority_overrides (user_id, period, week_monday, item, priority)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id, period, week_monday, item)
-                    DO UPDATE SET priority=EXCLUDED.priority
-                    """,
-                    (user_id, period, wk, item, int(prio)),
-                )
-        c.commit()
-
-
-def clear_weekly_overrides(cfg: DbConfig, user_id: str, period: str, week_monday: date) -> None:
-    wk = week_monday.isoformat()
-    with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "DELETE FROM item_priority_overrides WHERE user_id=%s AND period=%s AND week_monday=%s",
-                (user_id, period, wk),
-            )
-        c.commit()
+        rows = c.execute(
+            "SELECT text FROM items WHERE period=? ORDER BY priority DESC, position ASC",
+            (period,),
+        ).fetchall()
+    return [r["text"] for r in rows]
 
 
 # ----------------------------
@@ -255,38 +124,35 @@ def clear_weekly_overrides(cfg: DbConfig, user_id: str, period: str, week_monday
 
 def load_entries(cfg: DbConfig, user_id: str, bucket: str, period: str) -> Dict[str, Tuple[bool, str]]:
     with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                """
-                SELECT item, completed, note
-                FROM entries
-                WHERE user_id=%s AND bucket=%s AND period=%s
-                """,
-                (user_id, bucket, period),
-            )
-            rows = cur.fetchall()
-    return {item: (bool(done), note or "") for item, done, note in rows}
+        rows = c.execute(
+            """
+            SELECT item, completed, note
+            FROM entries
+            WHERE user_id=? AND bucket=? AND period=?
+            """,
+            (user_id, bucket, period),
+        ).fetchall()
+    return {r["item"]: (bool(r["completed"]), r["note"] or "") for r in rows}
 
 
 def save_entries(cfg: DbConfig, user_id: str, bucket: str, period: str, entries: Dict[str, Tuple[bool, str]]) -> None:
     with conn(cfg) as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "DELETE FROM entries WHERE user_id=%s AND bucket=%s AND period=%s",
-                (user_id, bucket, period),
-            )
-            cur.executemany(
-                """
-                INSERT INTO entries (user_id, bucket, period, item, completed, note)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                [(user_id, bucket, period, item, done, note or "") for item, (done, note) in entries.items()],
-            )
+        c.execute(
+            "DELETE FROM entries WHERE user_id=? AND bucket=? AND period=?",
+            (user_id, bucket, period),
+        )
+        c.executemany(
+            """
+            INSERT INTO entries (user_id, bucket, period, item, completed, note)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [(user_id, bucket, period, item, int(done), note or "") for item, (done, note) in entries.items()],
+        )
         c.commit()
 
 
 def top_focus_item(cfg: DbConfig, user_id: str, day: date) -> str:
-    items = get_items_with_effective_priority(cfg, user_id, "Daily", day)
+    items = get_items(cfg, "Daily")
     if not items:
         return "Plan / Review"
     saved = load_entries(cfg, user_id, day.isoformat(), "Daily")
@@ -361,21 +227,10 @@ STARTER_MONTHLY = [
 
 
 def main() -> None:
-    st.set_page_config(page_title="CEO Execution Tracker", layout="wide")
-    st.title("📈 CEO Execution Tracker")
+    st.set_page_config(page_title="CEO Execution Tracker (SQLite)", layout="wide")
+    st.title("📈 CEO Execution Tracker (SQLite)")
 
-    cfg = DbConfig(database_url=get_database_url())
-
-    try:
-        with conn(cfg) as c:
-            with c.cursor() as cur:
-                cur.execute("SELECT 1;")
-        st.sidebar.success("✅ Database connected")
-    except Exception as e:
-        st.sidebar.error(f"❌ DB connection failed: {type(e).__name__}")
-        st.sidebar.code(str(e)[:500])
-        st.stop()
-
+    cfg = DbConfig()
     init_db(cfg)
 
     with st.sidebar:
@@ -387,62 +242,6 @@ def main() -> None:
             st.success("Seeded starter lists.")
             st.rerun()
 
-        st.divider()
-        st.header("Admin")
-
-        with st.expander("Edit base priorities", expanded=False):
-            p = st.selectbox("Period", PERIODS, key="baseprio_period")
-            rows = get_items_for_edit(cfg, p)
-            updates: List[Tuple[int, int]] = []
-            for pos, text, prio in rows:
-                new_prio = st.number_input(
-                    f"{pos}. {text}",
-                    min_value=-10,
-                    max_value=10,
-                    value=int(prio),
-                    step=1,
-                    key=f"baseprio::{p}::{pos}",
-                )
-                if int(new_prio) != int(prio):
-                    updates.append((pos, int(new_prio)))
-            if st.button("Save base priorities", use_container_width=True, key="save_base"):
-                save_base_priorities(cfg, p, updates)
-                st.success("Saved.")
-                st.rerun()
-
-        with st.expander("Weekly priority overrides (this week)", expanded=False):
-            p = st.selectbox("Period (overrides)", PERIODS, key="wkprio_period")
-            wk = monday_of_week(date.today())
-            st.caption(f"Week starts: {wk.isoformat()}")
-            base = get_items_for_edit(cfg, p)
-            ov = get_weekly_overrides(cfg, USER_ID, p, wk)
-
-            to_save: Dict[str, int] = {}
-            for pos, text, base_pr in base:
-                effective = ov.get(text, int(base_pr))
-                new_pr = st.number_input(
-                    f"{pos}. {text}",
-                    min_value=-10,
-                    max_value=10,
-                    value=int(effective),
-                    step=1,
-                    key=f"wkprio::{p}::{wk.isoformat()}::{pos}",
-                )
-                if int(new_pr) != int(base_pr):
-                    to_save[text] = int(new_pr)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Save overrides", use_container_width=True, key="wk_save"):
-                    save_weekly_overrides(cfg, USER_ID, p, wk, to_save)
-                    st.success("Saved overrides.")
-                    st.rerun()
-            with c2:
-                if st.button("Clear overrides", use_container_width=True, key="wk_clear"):
-                    clear_weekly_overrides(cfg, USER_ID, p, wk)
-                    st.success("Cleared overrides.")
-                    st.rerun()
-
     tab_track, tab_calendar = st.tabs(["✅ Track", "📅 Calendar (Android)"])
 
     with tab_track:
@@ -450,7 +249,7 @@ def main() -> None:
         d = st.date_input("Date", value=date.today(), key="track_date")
         bucket = bucket_key(period, d)
 
-        items = get_items_with_effective_priority(cfg, USER_ID, period, d)
+        items = get_items(cfg, period)
         if not items:
             st.warning("No items yet. Click sidebar: First-time setup.")
             st.stop()
